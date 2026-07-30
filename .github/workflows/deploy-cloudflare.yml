@@ -273,7 +273,7 @@ jobs:
             jq '
               {
                 result: [
-                  .result[]? |
+                  .result.deployments[]? |
                   {
                     id,
                     created_on,
@@ -288,7 +288,7 @@ jobs:
             ' "$STATE_DIR/baseline-deployments.json" \
               > "$EVIDENCE_DIR/baseline-worker-deployments.json"
             jq '
-              .result[0] |
+              (.result.deployments[0] // {}) |
               {
                 strategy: (.strategy // "percentage"),
                 versions: [
@@ -567,7 +567,11 @@ jobs:
             jq '
               {
                 latest: (
-                  .result[0] |
+                  .result.deployments[0] //
+                  null |
+                  if . == null then
+                    null
+                  else
                   {
                     id,
                     created_on,
@@ -577,6 +581,7 @@ jobs:
                       {version_id, percentage}
                     ]
                   }
+                  end
                 )
               }
             ' "$deployment_response" > "$EVIDENCE_DIR/new-worker-deployment.json"
