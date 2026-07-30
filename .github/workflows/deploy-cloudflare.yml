@@ -271,9 +271,22 @@ jobs:
           if [[ "$deployments_status" == "200" ]]; then
             echo "WORKER_EXISTED=true" >> "$GITHUB_ENV"
             jq '
+              def normalize($key):
+                .result as $result |
+                if ($result | type) == "array" then
+                  $result
+                elif
+                  ($result | type) == "object" and
+                  (($result[$key] // null) | type) == "array"
+                then
+                  $result[$key]
+                else
+                  []
+                end;
+              normalize("deployments") as $deployments |
               {
                 result: [
-                  .result.deployments[]? |
+                  $deployments[]? |
                   {
                     id,
                     created_on,
@@ -288,7 +301,20 @@ jobs:
             ' "$STATE_DIR/baseline-deployments.json" \
               > "$EVIDENCE_DIR/baseline-worker-deployments.json"
             jq '
-              (.result.deployments[0] // {}) |
+              def normalize($key):
+                .result as $result |
+                if ($result | type) == "array" then
+                  $result
+                elif
+                  ($result | type) == "object" and
+                  (($result[$key] // null) | type) == "array"
+                then
+                  $result[$key]
+                else
+                  []
+                end;
+              normalize("deployments") as $deployments |
+              ($deployments[0] // {}) |
               {
                 strategy: (.strategy // "percentage"),
                 versions: [
@@ -315,8 +341,27 @@ jobs:
             "$STATE_DIR/baseline-schedules.status"
           schedules_status="$(<"$STATE_DIR/baseline-schedules.status")"
           if [[ "$schedules_status" == "200" ]]; then
-            jq '{result:[.result[]? | {id,cron,created_on,modified_on}]}' \
-              "$STATE_DIR/baseline-schedules.json" \
+            jq '
+              def normalize($key):
+                .result as $result |
+                if ($result | type) == "array" then
+                  $result
+                elif
+                  ($result | type) == "object" and
+                  (($result[$key] // null) | type) == "array"
+                then
+                  $result[$key]
+                else
+                  []
+                end;
+              normalize("schedules") as $schedules |
+              {
+                result: [
+                  $schedules[]? |
+                  {id,cron,created_on,modified_on}
+                ]
+              }
+            ' "$STATE_DIR/baseline-schedules.json" \
               > "$EVIDENCE_DIR/baseline-schedules.json"
           else
             jq -n --arg status "$schedules_status" \
@@ -331,9 +376,22 @@ jobs:
           domains_status="$(<"$STATE_DIR/baseline-domains.status")"
           if [[ "$domains_status" == "200" ]]; then
             jq --arg service "$WORKER_NAME" '
+              def normalize($key):
+                .result as $result |
+                if ($result | type) == "array" then
+                  $result
+                elif
+                  ($result | type) == "object" and
+                  (($result[$key] // null) | type) == "array"
+                then
+                  $result[$key]
+                else
+                  []
+                end;
+              normalize("records") as $records |
               {
                 result: [
-                  .result[]? |
+                  $records[]? |
                   select(.service == $service) |
                   {
                     id,
@@ -565,9 +623,22 @@ jobs:
           )"
           if [[ "$http_code" == "200" ]]; then
             jq '
+              def normalize($key):
+                .result as $result |
+                if ($result | type) == "array" then
+                  $result
+                elif
+                  ($result | type) == "object" and
+                  (($result[$key] // null) | type) == "array"
+                then
+                  $result[$key]
+                else
+                  []
+                end;
+              normalize("deployments") as $deployments |
               {
                 latest: (
-                  .result.deployments[0] //
+                  $deployments[0] //
                   null |
                   if . == null then
                     null
