@@ -1,271 +1,959 @@
-name: 🚀 Deploy cloud-mail to Cloudflare Workers
+name: Deploy cloud-mail v3.0.0 to Cloudflare Workers
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "mail-worker/**"
-      - "mail-vue/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-mail-production
+  cancel-in-progress: false
+
 jobs:
-  Deploy-cloud-mail:
-    name: 🏗️ Build and Deploy
+  deploy:
+    name: Build, deploy, initialize, and verify
     runs-on: ubuntu-latest
-
-    env:
-      NAME: ${{ secrets.NAME || vars.NAME || 'cloud-mail' }}
-      CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
-      DOMAIN: ${{ secrets.DOMAIN || vars.DOMAIN }}
-      ADMIN: ${{ secrets.ADMIN || vars.ADMIN }}
-      JWT_SECRET: ${{ secrets.JWT_SECRET || vars.JWT_SECRET }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || vars.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
-      KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID || vars.KV_NAMESPACE_ID }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
-      PROJECT_LINK: ${{ secrets.PROJECT_LINK || vars.PROJECT_LINK }}
-      AI_MODEL: ${{ secrets.AI_MODEL || vars.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct' }}
-      CLOUDFLARE_EMAIL: ${{ secrets.CF_EMAIL || vars.CF_EMAIL || false }}
-      ANALYSIS_CACHE: ${{ secrets.ANALYSIS_CACHE || vars.ANALYSIS_CACHE || false }}
-      LINUXDO_CLIENT_ID: ${{ secrets.LINUXDO_CLIENT_ID || vars.LINUXDO_CLIENT_ID }}
-      LINUXDO_CLIENT_SECRET: ${{ secrets.LINUXDO_CLIENT_SECRET || vars.LINUXDO_CLIENT_SECRET }}
-      LINUXDO_CALLBACK_URL: ${{ secrets.LINUXDO_CALLBACK_URL || vars.LINUXDO_CALLBACK_URL }}
-      LINUXDO_SWITCH: ${{ secrets.LINUXDO_SWITCH || vars.LINUXDO_SWITCH }}
-
-
-    outputs:
-      worker_url: ${{ steps.deploy.outputs.worker_url }}
-
+    timeout-minutes: 45
 
     steps:
-      - name: 🚚 检出代码仓库 / Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out immutable v3.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/tags/v3.0.0
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: ⚙ 设置 pnpm / Set up pnpm
-        uses: pnpm/action-setup@v4.1.0
+      - name: Verify immutable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="e68099edb3dc59c4064ccdcab663f79a6e0ededc"
+          head_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-parse 'refs/tags/v3.0.0^{}')"
+
+          if [[ "$head_sha" != "$expected_sha" ]]; then
+            echo "HEAD does not match the approved v3.0.0 commit." >&2
+            exit 1
+          fi
+          if [[ "$tag_sha" != "$expected_sha" ]]; then
+            echo "The dereferenced v3.0.0 tag does not match the approved commit." >&2
+            exit 1
+          fi
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
         with:
           version: 9
 
-      - name: ⚙ 设置 Node.js / Set up Node.js
-        uses: actions/setup-node@v
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
-          cache: "pnpm"
-          cache-dependency-path: "./mail-worker/pnpm-lock.yaml"
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: |
+            mail-vue/pnpm-lock.yaml
+            mail-worker/pnpm-lock.yaml
 
-      - name: 📦 安装依赖 / Install dependencies
-        run: pnpm install --frozen-lockfile
-        working-directory: ./mail-worker
-
-      - name: 📡 禁用 Wrangler 遥测 / Disable wrangler telemetry
-        working-directory: ./mail-worker
-        run: pnpm wrangler telemetry disable
-
-      - name: 🛠️ 设置环境 / Set up environment
-        working-directory: ./mail-worker
+      - name: Prepare private state and public evidence
+        shell: bash
         run: |
-          
-          echo "🔐 Starting environment setup..."
-          
-          if [ -z "$JWT_SECRET" ] || grep -q '[?%#/\\]' <<< "$JWT_SECRET"; then
-            echo "❌ JWT_SECRET variable is empty or contains invalid characters (?, %, #, /, \\)."
-            exit 1
-          fi
-          
-          if ! jq -e 'type == "array"' <<< "$DOMAIN" ; then
-            echo "❌ DOMAIN variable must be a JSON array (e.g., [\"example.com\"])."
-            exit 1
-          fi
-          
-          if [ -z "$ADMIN" ]; then
-            echo "❌ ADMIN variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "❌ CLOUDFLARE_ACCOUNT_ID variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "❌ CLOUDFLARE_API_TOKEN variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            echo "::warning:: CUSTOM_DOMAIN variable is not set."
-          fi
-          
-          CONFIG_FILE="wrangler-action.toml"
-          
-          if [ -z "$R2_BUCKET_NAME" ]; then
-            sed -i '/\[\[r2_buckets\]\]/,/^$/d' "$CONFIG_FILE"
-          fi
-          
-          if [ -z "$PROJECT_LINK" ]; then
-            sed -i '/^project_link = /d' "$CONFIG_FILE"
-          fi
-          
-          if [ -z "$LINUXDO_CLIENT_ID" ] || [ -z "$LINUXDO_CLIENT_SECRET" ]; then
-            sed -i '/^linuxdo_client_id = /,/^linuxdo_switch = /d' "$CONFIG_FILE"
-          fi
-          
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            sed -i '/\[\[routes\]\]/,/^$/d' "$CONFIG_FILE"
-          fi
-          
-          if [ "$(printf '%s' "$CLOUDFLARE_EMAIL" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
-            cat >> "$CONFIG_FILE" <<'EOF'
+          set -euo pipefail
+          state_dir="$RUNNER_TEMP/cloud-mail-deploy-state"
+          evidence_dir="$RUNNER_TEMP/cloud-mail-deploy-evidence"
+          install -d -m 700 "$state_dir"
+          install -d -m 700 "$evidence_dir"
+          {
+            echo "STATE_DIR=$state_dir"
+            echo "EVIDENCE_DIR=$evidence_dir"
+            echo "WORKER_NAME=cloud-mail"
+            echo "D1_NAME=cloud-mail"
+            echo "KV_NAME=cloud-mail"
+          } >> "$GITHUB_ENV"
+          jq -n \
+            --arg tag "v3.0.0" \
+            --arg sha "e68099edb3dc59c4064ccdcab663f79a6e0ededc" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{tag:$tag, commit:$sha, run_id:$run_id, run_attempt:$run_attempt}' \
+            > "$evidence_dir/source.json"
+          cat > "$evidence_dir/recovery.md" <<'EOF'
+          # cloud-mail deployment recovery notes
 
-          [[send_email]]
-          name = "email"
+          The workflow never restores a pre-existing D1 database or changes a
+          pre-existing KV value during failure handling. Private KV value snapshots
+          remain only on the ephemeral runner and are not uploaded.
+
+          If initialization started and the run failed, treat the result as a
+          critical partial failure. Review the recorded D1 bookmarks, KV hashes,
+          Worker deployment IDs, schedules, and custom-domain record identifiers
+          before making a manual recovery decision.
+          EOF
+
+      - name: Validate required secrets and Cloudflare access
+        shell: bash
+        env:
+          ADMIN: ${{ secrets.ADMIN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          for value in \
+            "$ADMIN" \
+            "$CLOUDFLARE_ACCOUNT_ID" \
+            "$CLOUDFLARE_API_TOKEN" \
+            "$CUSTOM_DOMAIN" \
+            "$DOMAIN" \
+            "$JWT_SECRET"; do
+            if [[ -z "$value" ]]; then
+              echo "A required repository secret is empty." >&2
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+
+          if [[ "$CUSTOM_DOMAIN" == *"://"* || "$CUSTOM_DOMAIN" == */* ]]; then
+            echo "CUSTOM_DOMAIN must be a hostname without a scheme or path." >&2
+            exit 1
+          fi
+          if ! jq -e '
+            type == "array" and
+            length > 0 and
+            all(.[]; type == "string" and length > 0)
+          ' <<< "$DOMAIN" >/dev/null; then
+            echo "DOMAIN must be a non-empty JSON array of domain strings." >&2
+            exit 1
+          fi
+
+          token_response="$STATE_DIR/token-verify.json"
+          http_code="$(
+            curl --silent --show-error \
+              --output "$token_response" \
+              --write-out "%{http_code}" \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify"
+          )"
+          if [[ "$http_code" != "200" ]] ||
+             ! jq -e '.success == true and .result.status == "active"' \
+               "$token_response" >/dev/null; then
+            echo "Cloudflare API token verification failed with HTTP $http_code." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies and build frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir mail-worker install --frozen-lockfile
+          pnpm --dir mail-vue install --frozen-lockfile
+          pnpm --dir mail-vue run build
+          test -d mail-worker/dist
+          test -n "$(find mail-worker/dist -type f -print -quit)"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Find or create D1 and KV resources
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+
+          d1_list="$STATE_DIR/d1-list.json"
+          pnpm wrangler d1 list --json > "$d1_list"
+          d1_count="$(
+            jq --arg name "$D1_NAME" \
+              '[.[] | select(.name == $name)] | length' "$d1_list"
+          )"
+          if [[ "$d1_count" -gt 1 ]]; then
+            echo "More than one D1 database is named $D1_NAME." >&2
+            exit 1
+          fi
+          if [[ "$d1_count" -eq 1 ]]; then
+            d1_created=false
+          else
+            pnpm wrangler d1 create "$D1_NAME"
+            pnpm wrangler d1 list --json > "$d1_list"
+            d1_created=true
+          fi
+          d1_id="$(
+            jq -r --arg name "$D1_NAME" \
+              '[.[] | select(.name == $name)][0].uuid // empty' "$d1_list"
+          )"
+          if [[ -z "$d1_id" ]]; then
+            echo "Unable to resolve the D1 database ID." >&2
+            exit 1
+          fi
+
+          kv_list="$STATE_DIR/kv-list.json"
+          pnpm wrangler kv namespace list > "$kv_list"
+          kv_count="$(
+            jq --arg name "$KV_NAME" \
+              '[.[] | select(.title == $name)] | length' "$kv_list"
+          )"
+          if [[ "$kv_count" -gt 1 ]]; then
+            echo "More than one KV namespace is named $KV_NAME." >&2
+            exit 1
+          fi
+          if [[ "$kv_count" -eq 1 ]]; then
+            kv_created=false
+          else
+            pnpm wrangler kv namespace create "$KV_NAME"
+            pnpm wrangler kv namespace list > "$kv_list"
+            kv_created=true
+          fi
+          kv_id="$(
+            jq -r --arg name "$KV_NAME" \
+              '[.[] | select(.title == $name)][0].id // empty' "$kv_list"
+          )"
+          if [[ -z "$kv_id" ]]; then
+            echo "Unable to resolve the KV namespace ID." >&2
+            exit 1
+          fi
+
+          {
+            echo "D1_DATABASE_ID=$d1_id"
+            echo "D1_CREATED=$d1_created"
+            echo "KV_NAMESPACE_ID=$kv_id"
+            echo "KV_CREATED=$kv_created"
+          } >> "$GITHUB_ENV"
+
+          jq -n \
+            --arg d1_name "$D1_NAME" \
+            --arg d1_id "$d1_id" \
+            --argjson d1_created "$d1_created" \
+            --arg kv_name "$KV_NAME" \
+            --arg kv_id "$kv_id" \
+            --argjson kv_created "$kv_created" \
+            '{
+              d1:{name:$d1_name,id:$d1_id,created_by_run:$d1_created},
+              kv:{name:$kv_name,id:$kv_id,created_by_run:$kv_created}
+            }' > "$EVIDENCE_DIR/resources.json"
+
+      - name: Capture pre-deployment baselines
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+
+          capture_api() {
+            local url="$1"
+            local private_output="$2"
+            local status_output="$3"
+            local code
+            code="$(
+              curl --silent --show-error \
+                --output "$private_output" \
+                --write-out "%{http_code}" \
+                --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$url"
+            )"
+            printf '%s\n' "$code" > "$status_output"
+          }
+
+          api_base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          capture_api \
+            "$api_base/workers/scripts/$WORKER_NAME/deployments" \
+            "$STATE_DIR/baseline-deployments.json" \
+            "$STATE_DIR/baseline-deployments.status"
+          deployments_status="$(<"$STATE_DIR/baseline-deployments.status")"
+
+          if [[ "$deployments_status" == "200" ]]; then
+            echo "WORKER_EXISTED=true" >> "$GITHUB_ENV"
+            jq '
+              {
+                result: [
+                  .result[]? |
+                  {
+                    id,
+                    created_on,
+                    strategy,
+                    versions: [
+                      .versions[]? |
+                      {version_id, percentage}
+                    ]
+                  }
+                ]
+              }
+            ' "$STATE_DIR/baseline-deployments.json" \
+              > "$EVIDENCE_DIR/baseline-worker-deployments.json"
+            jq '
+              .result[0] |
+              {
+                strategy: (.strategy // "percentage"),
+                versions: [
+                  .versions[]? |
+                  {version_id, percentage}
+                ]
+              }
+            ' "$STATE_DIR/baseline-deployments.json" \
+              > "$STATE_DIR/baseline-rollback-request.json"
+          elif [[ "$deployments_status" == "404" ]]; then
+            echo "WORKER_EXISTED=false" >> "$GITHUB_ENV"
+            jq -n '{result:[],status:404}' \
+              > "$EVIDENCE_DIR/baseline-worker-deployments.json"
+          else
+            echo "WORKER_EXISTED=unknown" >> "$GITHUB_ENV"
+            jq -n --arg status "$deployments_status" \
+              '{available:false,http_status:$status}' \
+              > "$EVIDENCE_DIR/baseline-worker-deployments.json"
+          fi
+
+          capture_api \
+            "$api_base/workers/scripts/$WORKER_NAME/schedules" \
+            "$STATE_DIR/baseline-schedules.json" \
+            "$STATE_DIR/baseline-schedules.status"
+          schedules_status="$(<"$STATE_DIR/baseline-schedules.status")"
+          if [[ "$schedules_status" == "200" ]]; then
+            jq '{result:[.result[]? | {id,cron,created_on,modified_on}]}' \
+              "$STATE_DIR/baseline-schedules.json" \
+              > "$EVIDENCE_DIR/baseline-schedules.json"
+          else
+            jq -n --arg status "$schedules_status" \
+              '{available:false,http_status:$status}' \
+              > "$EVIDENCE_DIR/baseline-schedules.json"
+          fi
+
+          capture_api \
+            "$api_base/workers/domains/records" \
+            "$STATE_DIR/baseline-domains.json" \
+            "$STATE_DIR/baseline-domains.status"
+          domains_status="$(<"$STATE_DIR/baseline-domains.status")"
+          if [[ "$domains_status" == "200" ]]; then
+            jq --arg service "$WORKER_NAME" '
+              {
+                result: [
+                  .result[]? |
+                  select(.service == $service) |
+                  {
+                    id,
+                    zone_id,
+                    service,
+                    environment,
+                    hostname_redacted:true
+                  }
+                ],
+                note:
+                  "custom-domain hostnames are intentionally omitted"
+              }
+            ' "$STATE_DIR/baseline-domains.json" \
+              > "$EVIDENCE_DIR/baseline-domain-records.json"
+          else
+            jq -n --arg status "$domains_status" \
+              '{available:false,http_status:$status}' \
+              > "$EVIDENCE_DIR/baseline-domain-records.json"
+          fi
+
+          if [[ "$D1_CREATED" == "false" ]]; then
+            pnpm wrangler d1 time-travel info "$D1_NAME" --json \
+              > "$STATE_DIR/d1-pre-init.json"
+            d1_bookmark="$(
+              jq -r '[.. | objects | .bookmark? // empty][0] // empty' \
+                "$STATE_DIR/d1-pre-init.json"
+            )"
+            if [[ -z "$d1_bookmark" ]]; then
+              echo "Unable to capture the pre-existing D1 bookmark." >&2
+              exit 1
+            fi
+            jq -n --arg bookmark "$d1_bookmark" \
+              '{pre_existing:true,pre_init_bookmark:$bookmark}' \
+              > "$EVIDENCE_DIR/d1-baseline.json"
+          else
+            jq -n '{pre_existing:false,pre_init_bookmark:null}' \
+              > "$EVIDENCE_DIR/d1-baseline.json"
+          fi
+
+          kv_snapshot="$STATE_DIR/kv-setting-pre-init.bin"
+          kv_code="$(
+            curl --silent --show-error \
+              --output "$kv_snapshot" \
+              --write-out "%{http_code}" \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api_base/storage/kv/namespaces/$KV_NAMESPACE_ID/values/setting%3A"
+          )"
+          chmod 600 "$kv_snapshot"
+          if [[ "$kv_code" == "200" ]]; then
+            kv_exists=true
+            kv_hash="$(sha256sum "$kv_snapshot" | awk '{print $1}')"
+          elif [[ "$kv_code" == "404" ]]; then
+            kv_exists=false
+            kv_hash=""
+            : > "$kv_snapshot"
+          else
+            echo "Unable to capture the KV setting baseline: HTTP $kv_code." >&2
+            exit 1
+          fi
+          {
+            echo "KV_PRE_INIT_EXISTS=$kv_exists"
+            echo "KV_PRE_INIT_HASH=$kv_hash"
+          } >> "$GITHUB_ENV"
+          jq -n \
+            --argjson pre_existing "$([[ "$KV_CREATED" == "false" ]] && echo true || echo false)" \
+            --argjson key_exists "$kv_exists" \
+            --arg hash "$kv_hash" \
+            '{
+              pre_existing_namespace:$pre_existing,
+              key:"setting:",
+              key_existed:$key_exists,
+              sha256:(if $hash == "" then null else $hash end),
+              value_uploaded:false
+            }' > "$EVIDENCE_DIR/kv-baseline.json"
+
+      - name: Generate runtime Wrangler configuration
+        shell: bash
+        env:
+          ADMIN: ${{ secrets.ADMIN }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          AI_MODEL: ${{ vars.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct' }}
+          ANALYSIS_CACHE: ${{ vars.ANALYSIS_CACHE || 'false' }}
+          CF_EMAIL: ${{ vars.CF_EMAIL || 'false' }}
+          PROJECT_LINK: ${{ vars.PROJECT_LINK }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          config_file="$GITHUB_WORKSPACE/mail-worker/wrangler.runtime.toml"
+          secrets_file="$STATE_DIR/wrangler-secrets.json"
+          umask 077
+
+          export CONFIG_FILE="$config_file"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          source = Path("mail-worker/wrangler-action.toml")
+          destination = Path(os.environ["CONFIG_FILE"])
+          text = source.read_text(encoding="utf-8")
+
+          required = {
+              "${NAME}",
+              "${CUSTOM_DOMAIN}",
+              "${D1_DATABASE_ID}",
+              "${KV_NAMESPACE_ID}",
+              "${DOMAIN}",
+              "${ADMIN}",
+              "${JWT_SECRET}",
+          }
+          missing = sorted(value for value in required if value not in text)
+          if missing:
+              raise SystemExit(f"Template placeholders are missing: {missing}")
+
+          def toml_string(value: str) -> str:
+              return json.dumps(value, ensure_ascii=True)
+
+          def replace_assignment(name: str, value: str) -> None:
+              global text
+              pattern = rf"(?m)^{re.escape(name)}\s*=.*$"
+              text, count = re.subn(pattern, f"{name} = {value}", text)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {name} assignment, found {count}")
+
+          replace_assignment("name", toml_string("cloud-mail"))
+          replace_assignment("pattern", toml_string(os.environ["CUSTOM_DOMAIN"]))
+          replace_assignment("database_name", toml_string("cloud-mail"))
+          replace_assignment("database_id", toml_string(os.environ["D1_DATABASE_ID"]))
+          replace_assignment("id", toml_string(os.environ["KV_NAMESPACE_ID"]))
+          replace_assignment("ai_model", toml_string(os.environ["AI_MODEL"]))
+          replace_assignment(
+              "analysis_cache",
+              toml_string(os.environ["ANALYSIS_CACHE"]),
+          )
+          replace_assignment("domain", os.environ["DOMAIN"])
+
+          text, admin_count = re.subn(r"(?m)^admin\s*=.*\n?", "", text)
+          text, jwt_count = re.subn(r"(?m)^jwt_secret\s*=.*\n?", "", text)
+          if admin_count != 1 or jwt_count != 1:
+              raise SystemExit("Expected admin and jwt_secret in the template vars")
+
+          optional_project = os.environ.get("PROJECT_LINK", "")
+          if optional_project:
+              replace_assignment("project_link", toml_string(optional_project))
+          else:
+              text = re.sub(r"(?m)^project_link\s*=.*\n?", "", text)
+
+          for name in (
+              "linuxdo_client_id",
+              "linuxdo_client_secret",
+              "linuxdo_callback_url",
+              "linuxdo_switch",
+          ):
+              text = re.sub(rf"(?m)^{name}\s*=.*\n?", "", text)
+
+          r2_name = os.environ.get("R2_BUCKET_NAME", "")
+          if r2_name:
+              replace_assignment("bucket_name", toml_string(r2_name))
+          else:
+              text, count = re.subn(
+                  r"(?ms)^\[\[r2_buckets\]\]\n.*?(?=^\[)",
+                  "",
+                  text,
+              )
+              if count != 1:
+                  raise SystemExit("Unable to remove the optional R2 binding")
+
+          text = re.sub(r"(?ms)^\[build\]\n.*\Z", "", text)
+          text = text.replace(
+              'compatibility_date = "2025-06-04"\n',
+              'compatibility_date = "2025-06-04"\n'
+              "workers_dev = false\n"
+              "preview_urls = false\n",
+              1,
+          )
+          if os.environ.get("CF_EMAIL", "").lower() == "true":
+              text += '\n[[send_email]]\nname = "email"\n'
+
+          if "${" in text:
+              raise SystemExit("The generated Wrangler config has unresolved placeholders")
+          parsed = tomllib.loads(text)
+          if parsed.get("workers_dev") is not False:
+              raise SystemExit("workers_dev must be false")
+          if parsed.get("preview_urls") is not False:
+              raise SystemExit("preview_urls must be false")
+          if "jwt_secret" in parsed.get("vars", {}):
+              raise SystemExit("jwt_secret must not be a plain-text vars binding")
+          if "admin" in parsed.get("vars", {}):
+              raise SystemExit("admin must not be a plain-text vars binding")
+          destination.write_text(text, encoding="utf-8")
+          PY
+
+          jq -n \
+            --arg admin "$ADMIN" \
+            --arg jwt_secret "$JWT_SECRET" \
+            '{admin:$admin,jwt_secret:$jwt_secret}' > "$secrets_file"
+          chmod 600 "$config_file" "$secrets_file"
+          {
+            echo "WRANGLER_CONFIG=$config_file"
+            echo "WRANGLER_SECRETS_FILE=$secrets_file"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy v3.0.0
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+          printf '1\n' > "$STATE_DIR/deploy-attempted"
+          pnpm wrangler deploy \
+            --config "$WRANGLER_CONFIG" \
+            --secrets-file "$WRANGLER_SECRETS_FILE"
+          printf '1\n' > "$STATE_DIR/deploy-succeeded"
+
+          api_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/deployments"
+          deployment_response="$STATE_DIR/post-deploy-deployments.json"
+          http_code="$(
+            curl --silent --show-error \
+              --output "$deployment_response" \
+              --write-out "%{http_code}" \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api_url"
+          )"
+          if [[ "$http_code" == "200" ]]; then
+            jq '
+              {
+                latest: (
+                  .result[0] |
+                  {
+                    id,
+                    created_on,
+                    strategy,
+                    versions: [
+                      .versions[]? |
+                      {version_id, percentage}
+                    ]
+                  }
+                )
+              }
+            ' "$deployment_response" > "$EVIDENCE_DIR/new-worker-deployment.json"
+          else
+            jq -n --arg status "$http_code" \
+              '{available:false,http_status:$status}' \
+              > "$EVIDENCE_DIR/new-worker-deployment.json"
+          fi
+
+      - name: Initialize through the custom domain
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$JWT_SECRET"
+          encoded_secret="$(jq -rn --arg value "$JWT_SECRET" '$value | @uri')"
+          init_url="https://$CUSTOM_DOMAIN/api/init/$encoded_secret"
+
+          ready=false
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if ready_code="$(
+              curl --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --output /dev/null \
+                --write-out "%{http_code}" \
+                "https://$CUSTOM_DOMAIN/"
+            )"; then
+              :
+            else
+              ready_code="000"
+            fi
+            if [[ "$ready_code" =~ ^[234][0-9][0-9]$ ]]; then
+              ready=true
+              break
+            fi
+            if [[ "$attempt" -lt 12 ]]; then
+              sleep 5
+            fi
+          done
+          if [[ "$ready" != "true" ]]; then
+            echo "The custom domain did not become ready within the retry bound." >&2
+            exit 1
+          fi
+
+          response_file="$STATE_DIR/init-response.txt"
+          printf '1\n' > "$STATE_DIR/init-started"
+          http_code="$(
+            curl --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 120 \
+              --output "$response_file" \
+              --write-out "%{http_code}" \
+              "$init_url"
+          )"
+
+          response_body="$(<"$response_file")"
+          if [[ "$http_code" == "200" && "$response_body" == "success" ]]; then
+            jq -n \
+              --arg status "$http_code" \
+              '{http_status:$status,body:"success"}' \
+              > "$EVIDENCE_DIR/init-result.json"
+          else
+            response_hash="$(sha256sum "$response_file" | awk '{print $1}')"
+            response_bytes="$(wc -c < "$response_file" | tr -d ' ')"
+            jq -n \
+              --arg status "$http_code" \
+              --arg hash "$response_hash" \
+              --argjson bytes "$response_bytes" \
+              '{
+                http_status:$status,
+                body_sha256:$hash,
+                body_bytes:$bytes,
+                body_uploaded:false
+              }' > "$EVIDENCE_DIR/init-result.json"
+            echo "Initialization did not return HTTP 200 with the exact success body." >&2
+            exit 1
+          fi
+          printf '1\n' > "$STATE_DIR/init-succeeded"
+
+      - name: Capture the post-init verification baseline
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+          pnpm wrangler d1 time-travel info "$D1_NAME" --json \
+            > "$STATE_DIR/d1-before-negative.json"
+          bookmark="$(
+            jq -r '[.. | objects | .bookmark? // empty][0] // empty' \
+              "$STATE_DIR/d1-before-negative.json"
+          )"
+          if [[ -z "$bookmark" ]]; then
+            echo "Unable to capture the D1 bookmark before negative verification." >&2
+            exit 1
+          fi
+          echo "D1_BEFORE_NEGATIVE=$bookmark" >> "$GITHUB_ENV"
+
+          api_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/setting%3A"
+          previous_signature=""
+          stable_count=0
+          for attempt in 1 2 3 4 5 6; do
+            value_file="$STATE_DIR/kv-setting-before-negative-$attempt.bin"
+            http_code="$(
+              curl --silent --show-error \
+                --output "$value_file" \
+                --write-out "%{http_code}" \
+                --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$api_url"
+            )"
+            chmod 600 "$value_file"
+            if [[ "$http_code" == "200" ]]; then
+              signature="present:$(sha256sum "$value_file" | awk '{print $1}')"
+            elif [[ "$http_code" == "404" ]]; then
+              signature="absent"
+            else
+              echo "Unable to read KV before negative verification: HTTP $http_code." >&2
+              exit 1
+            fi
+
+            if [[ "$signature" == "$previous_signature" ]]; then
+              stable_count=$((stable_count + 1))
+            else
+              stable_count=1
+              previous_signature="$signature"
+            fi
+            if [[ "$stable_count" -ge 2 ]]; then
+              break
+            fi
+            if [[ "$attempt" -lt 6 ]]; then
+              sleep 5
+            fi
+          done
+          if [[ "$stable_count" -lt 2 ]]; then
+            echo "KV did not reach a stable fingerprint within the retry bound." >&2
+            exit 1
+          fi
+          echo "KV_BEFORE_NEGATIVE=$previous_signature" >> "$GITHUB_ENV"
+          jq -n \
+            --arg d1_bookmark "$bookmark" \
+            --arg kv_signature "$previous_signature" \
+            '{d1_bookmark:$d1_bookmark,kv_signature:$kv_signature}' \
+            > "$EVIDENCE_DIR/pre-negative-state.json"
+
+      - name: Verify a wrong secret has no D1 or KV side effects
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+        working-directory: mail-worker
+        run: |
+          set -euo pipefail
+          negative_secret="$(
+            node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+          )"
+          echo "::add-mask::$negative_secret"
+          encoded_secret="$(jq -rn --arg value "$negative_secret" '$value | @uri')"
+          negative_url="https://$CUSTOM_DOMAIN/api/init/$encoded_secret"
+          response_file="$STATE_DIR/negative-response.txt"
+          http_code="$(
+            curl --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 60 \
+              --output "$response_file" \
+              --write-out "%{http_code}" \
+              "$negative_url"
+          )"
+          response_body="$(<"$response_file")"
+          expected_body="$(printf '\342\235\214 JWT secret mismatch')"
+          if [[ "$http_code" != "200" || "$response_body" != "$expected_body" ]]; then
+            echo "Wrong-secret verification did not return the exact mismatch response." >&2
+            exit 1
+          fi
+
+          pnpm wrangler d1 time-travel info "$D1_NAME" --json \
+            > "$STATE_DIR/d1-after-negative.json"
+          d1_after="$(
+            jq -r '[.. | objects | .bookmark? // empty][0] // empty' \
+              "$STATE_DIR/d1-after-negative.json"
+          )"
+          if [[ -z "$d1_after" || "$d1_after" != "$D1_BEFORE_NEGATIVE" ]]; then
+            echo "The D1 bookmark changed during wrong-secret verification." >&2
+            exit 1
+          fi
+
+          api_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE_ID/values/setting%3A"
+          kv_match=false
+          observed_signature=""
+          for attempt in 1 2 3 4 5 6; do
+            value_file="$STATE_DIR/kv-setting-after-negative-$attempt.bin"
+            kv_code="$(
+              curl --silent --show-error \
+                --output "$value_file" \
+                --write-out "%{http_code}" \
+                --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$api_url"
+            )"
+            chmod 600 "$value_file"
+            if [[ "$kv_code" == "200" ]]; then
+              observed_signature="present:$(sha256sum "$value_file" | awk '{print $1}')"
+            elif [[ "$kv_code" == "404" ]]; then
+              observed_signature="absent"
+            else
+              echo "Unable to read KV after negative verification: HTTP $kv_code." >&2
+              exit 1
+            fi
+            if [[ "$observed_signature" == "$KV_BEFORE_NEGATIVE" ]]; then
+              kv_match=true
+              break
+            fi
+            if [[ "$attempt" -lt 6 ]]; then
+              sleep 5
+            fi
+          done
+          if [[ "$kv_match" != "true" ]]; then
+            echo "The KV fingerprint changed during wrong-secret verification." >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg status "$http_code" \
+            --arg body "JWT secret mismatch" \
+            --arg d1_before "$D1_BEFORE_NEGATIVE" \
+            --arg d1_after "$d1_after" \
+            --arg kv_before "$KV_BEFORE_NEGATIVE" \
+            --arg kv_after "$observed_signature" \
+            '{
+              http_status:$status,
+              body:$body,
+              d1_bookmark_before:$d1_before,
+              d1_bookmark_after:$d1_after,
+              kv_signature_before:$kv_before,
+              kv_signature_after:$kv_after,
+              side_effects_detected:false
+            }' > "$EVIDENCE_DIR/negative-secret-verification.json"
+          printf '1\n' > "$STATE_DIR/verification-succeeded"
+
+      - name: Confirm source remained unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code
+          test "$(git rev-parse HEAD)" = \
+            "e68099edb3dc59c4064ccdcab663f79a6e0ededc"
+
+      - name: Handle a failed deployment safely
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          STATE_DIR="${STATE_DIR:-$RUNNER_TEMP/cloud-mail-deploy-state}"
+          EVIDENCE_DIR="${EVIDENCE_DIR:-$RUNNER_TEMP/cloud-mail-deploy-evidence}"
+          install -d -m 700 "$STATE_DIR"
+          install -d -m 700 "$EVIDENCE_DIR"
+          failure_mode="pre-deploy"
+          rollback_status="not-attempted"
+
+          if [[ -f "$STATE_DIR/init-started" ]]; then
+            failure_mode="critical-partial-failure-after-init-started"
+            rollback_status="refused"
+            cat >> "$EVIDENCE_DIR/recovery.md" <<'EOF'
+
+          ## Critical partial failure
+
+          Initialization started. No automatic Worker, D1, or KV rollback was
+          attempted because the v3.0.0 initialization contains schema and data
+          mutations that cannot be safely reversed by this workflow. A pre-existing
+          D1 database must never be auto-restored. A pre-existing KV `setting:`
+          value must never be overwritten automatically; compare the private
+          runner snapshot and recorded hashes before any manual action.
+          EOF
+          elif [[ -f "$STATE_DIR/deploy-attempted" ]]; then
+            failure_mode="deployment-failure-before-init"
+            api_base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+
+            if [[ "${WORKER_EXISTED:-unknown}" == "true" ]] &&
+               [[ -s "$STATE_DIR/baseline-rollback-request.json" ]] &&
+               jq -e '.versions | length > 0' \
+                 "$STATE_DIR/baseline-rollback-request.json" >/dev/null; then
+              rollback_response="$STATE_DIR/rollback-response.json"
+              rollback_code="$(
+                curl --silent --show-error \
+                  --request POST \
+                  --output "$rollback_response" \
+                  --write-out "%{http_code}" \
+                  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                  --header "Content-Type: application/json" \
+                  --data-binary "@$STATE_DIR/baseline-rollback-request.json" \
+                  "$api_base/workers/scripts/$WORKER_NAME/deployments"
+              )"
+              if [[ "$rollback_code" == "200" ]] &&
+                 jq -e '.success == true' "$rollback_response" >/dev/null; then
+                rollback_status="worker-versions-restored"
+              else
+                rollback_status="worker-version-rollback-failed-http-$rollback_code"
+              fi
+            elif [[ "${WORKER_EXISTED:-unknown}" == "false" ]]; then
+              delete_response="$STATE_DIR/delete-new-worker-response.json"
+              delete_code="$(
+                curl --silent --show-error \
+                  --request DELETE \
+                  --output "$delete_response" \
+                  --write-out "%{http_code}" \
+                  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                  "$api_base/workers/scripts/$WORKER_NAME"
+              )"
+              if [[ "$delete_code" == "200" || "$delete_code" == "404" ]]; then
+                rollback_status="new-worker-removed-or-absent"
+              else
+                rollback_status="new-worker-delete-failed-http-$delete_code"
+              fi
+            else
+              rollback_status="refused-worker-baseline-unavailable"
+            fi
+
+            cat >> "$EVIDENCE_DIR/recovery.md" <<'EOF'
+
+          ## Failure before initialization
+
+          Worker version recovery was attempted only when a trustworthy baseline
+          was available. Custom-domain records and Cron schedules were recorded
+          separately and were not automatically rewritten. D1 and KV resources,
+          including resources created by this run, were preserved for inspection.
+          No pre-existing storage was deleted or overwritten.
           EOF
           fi
 
-          sed -i "s|\${NAME}|${NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${CUSTOM_DOMAIN}|${CUSTOM_DOMAIN}|g" "$CONFIG_FILE"
-          sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" "$CONFIG_FILE"
-          sed -i "s|\${ADMIN}|${ADMIN}|g" "$CONFIG_FILE"
-          sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" "$CONFIG_FILE"
-          sed -i "s|\${R2_BUCKET_NAME}|${R2_BUCKET_NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${PROJECT_LINK}|${PROJECT_LINK}|g" "$CONFIG_FILE"
-          sed -i "s|\${ANALYSIS_CACHE}|${ANALYSIS_CACHE}|g" "$CONFIG_FILE"
-          sed -i "s|\${AI_MODEL}|${AI_MODEL}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CLIENT_ID}|${LINUXDO_CLIENT_ID}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CLIENT_SECRET}|${LINUXDO_CLIENT_SECRET}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CALLBACK_URL}|${LINUXDO_CALLBACK_URL}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_SWITCH}|${LINUXDO_SWITCH}|g" "$CONFIG_FILE"
-          
-          echo "✅ Environment setup completed."
+          jq -n \
+            --arg failure_mode "$failure_mode" \
+            --arg rollback_status "$rollback_status" \
+            --arg d1_created "${D1_CREATED:-unknown}" \
+            --arg kv_created "${KV_CREATED:-unknown}" \
+            '{
+              failure_mode:$failure_mode,
+              worker_recovery:$rollback_status,
+              d1_created_by_run:$d1_created,
+              kv_created_by_run:$kv_created,
+              d1_auto_restore:false,
+              kv_auto_restore:false,
+              routes_auto_restore:false,
+              schedules_auto_restore:false
+            }' > "$EVIDENCE_DIR/failure-handling.json"
 
-      - name: ⚡ 设置KV数据库 / Set up KV database
-        working-directory: ./mail-worker
-        run: |
-          
-          CONFIG_FILE="wrangler-action.toml"
-          
-          if [ -n "$KV_NAMESPACE_ID" ]; then
-            sed -i "s|\${KV_NAMESPACE_ID}|${KV_NAMESPACE_ID}|g" "$CONFIG_FILE"
-            echo "✅ Using the database from environment variables."
-            exit 0
-          fi
-          
-          echo "🔍 Checking if the database exists..."
-          
-          set +e
-            KV_LIST=$(pnpm wrangler kv namespace list 2>&1)
-            STATUS=$?
-          set -e
-          
-          if [ $STATUS -ne 0 ]; then
-            echo "$KV_LIST"
-            exit 1
-          fi
-                  
-          if echo "$KV_LIST" | jq -e ".[] | select(.title == \"$NAME\")" >/dev/null; then
-            echo "✅ Database $NAME already exists."
-            KV_ID=$(echo "$KV_LIST" | jq -r ".[] | select(.title == \"$NAME\") | .id")
-            echo "KV_NAMESPACE_ID: $KV_ID"
-          else
-            echo "⚠️ Database $NAME does not exist. Starting creation..."
-            pnpm wrangler kv namespace create $NAME
-            KV_LIST=$(pnpm wrangler kv namespace list)
-            KV_ID=$(echo "$KV_LIST" | jq -r ".[] | select(.title == \"$NAME\") | .id")
-          fi
-          
-          sed -i "s|\${KV_NAMESPACE_ID}|$KV_ID|g" "$CONFIG_FILE"
-          echo "✅ Setup completed."
-
-      - name: 🐬 设置D1数据库 / Set up D1 database
-        working-directory: ./mail-worker
-        run: |
-          
-          CONFIG_FILE="wrangler-action.toml"
-          
-          if [ -n "$D1_DATABASE_ID" ]; then
-            sed -i "s|\${D1_DATABASE_ID}|${D1_DATABASE_ID}|g" "$CONFIG_FILE"
-            echo "✅ Using the database from environment variables."
-            exit 0
-          fi
-          
-          echo "🔍 Checking if the database exists..."
-          
-          set +e
-            DB_LIST=$(pnpm wrangler d1 list --json 2>&1)
-            STATUS=$?
-          set -e
-          
-          if [ $STATUS -ne 0 ]; then
-            echo "$DB_LIST"
-            exit 1
-          fi
-          
-          if echo "$DB_LIST" | jq -e ".[] | select(.name == \"$NAME\")" >/dev/null; then
-            echo "✅ Database $NAME already exists."
-            D1_ID=$(echo "$DB_LIST" | jq -r ".[] | select(.name == \"$NAME\") | .uuid")
-            echo "D1_DATABASE_ID: $D1_ID"
-          else
-            echo "⚠️ Database $NAME does not exist. Starting creation..."
-            pnpm wrangler d1 create $NAME
-            DB_LIST=$(pnpm wrangler d1 list --json)
-            D1_ID=$(echo "$DB_LIST" | jq -r ".[] | select(.name == \"$NAME\") | .uuid")
-          fi
-          
-          sed -i "s|\${D1_DATABASE_ID}|$D1_ID|g" "$CONFIG_FILE"
-          echo "✅ Setup completed."
-
-      - name: 🚀 开始部署 / Start deployment
-        id: deploy
-        working-directory: ./mail-worker
-        run: |
-          echo "🚀 Starting deployment..."
-          pnpm wrangler deploy -c wrangler-action.toml 2>&1 \
-            | tee deploy.log \
-            | grep -v "https://.*\.workers\.dev" \
-            | sed -E 's/env\.domain .*/env.domain (***)/' \
-            || true
-          
-          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
-          if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
-            exit 1
-          fi
-          
-          WORKER_URL=$(grep -o "https://.*\.workers\.dev" deploy.log || echo "")
-          
-          if [ -n "$WORKER_URL" ]; then
-            echo "::add-mask::$WORKER_URL"
-          fi
-          
-          echo "worker_url=$WORKER_URL" >> $GITHUB_OUTPUT
-          echo "✅ Setup completed."
-
-      - name: ♻️ 初始化数据库 / Initialize database
-        run: |
-          echo "🛠️ Starting database initialization..."
-          sleep 15
-          
-          WORKER_URL="${CUSTOM_DOMAIN:+https://$CUSTOM_DOMAIN}"
-          WORKER_URL="${WORKER_URL:-${{ steps.deploy.outputs.worker_url }}}"
-          
-          if [ -z "$WORKER_URL" ]; then
-            echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN."
-            exit 1
-          fi
-          
-          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$WORKER_URL/api/init/${JWT_SECRET}")
-          RESPONSE_BODY=$(cat response.txt)
-
-          if [ "$RESPONSE_BODY" = "success" ]; then
-            echo "✅ Setup completed."
-          else
-            echo "❌ Failed. HTTP: $HTTP_CODE, Response: $RESPONSE_BODY"
-            exit 1
-          fi
-
-      - name: 🗑️ 删除运行记录 / Delete workflow runs
-        uses: GitRML/delete-workflow-runs@main
-        continue-on-error: true
+      - name: Upload non-secret deployment evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          retain_days: '1'
-          keep_minimum_runs: '0'
+          name: cloud-mail-v3-deployment-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cloud-mail-deploy-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove private deployment material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${WRANGLER_CONFIG:-}" && -f "$WRANGLER_CONFIG" ]]; then
+            rm -f "$WRANGLER_CONFIG"
+          fi
+          if [[ -n "${WRANGLER_SECRETS_FILE:-}" &&
+                -f "$WRANGLER_SECRETS_FILE" ]]; then
+            rm -f "$WRANGLER_SECRETS_FILE"
+          fi
+          if [[ -n "${STATE_DIR:-}" && -d "$STATE_DIR" ]]; then
+            find "$STATE_DIR" -type f -exec shred -u {} +
+            rmdir "$STATE_DIR"
+          fi
