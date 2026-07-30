@@ -607,9 +607,24 @@ jobs:
         run: |
           set -euo pipefail
           printf '1\n' > "$STATE_DIR/deploy-attempted"
+          deploy_log="$STATE_DIR/wrangler-deploy.log"
+          : > "$deploy_log"
+          chmod 600 "$deploy_log"
+
+          set +e
           pnpm wrangler deploy \
             --config "$WRANGLER_CONFIG" \
-            --secrets-file "$WRANGLER_SECRETS_FILE"
+            --secrets-file "$WRANGLER_SECRETS_FILE" \
+            > "$deploy_log" 2>&1
+          deploy_exit_code=$?
+          set -e
+
+          if [[ "$deploy_exit_code" -ne 0 ]]; then
+            echo "Wrangler deployment failed. Final log lines follow." >&2
+            tail -n 120 "$deploy_log" >&2
+            exit "$deploy_exit_code"
+          fi
+          echo "Wrangler deployment completed successfully."
           printf '1\n' > "$STATE_DIR/deploy-succeeded"
 
           api_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/deployments"
